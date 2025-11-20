@@ -1,70 +1,214 @@
 #![allow(clippy::result_large_err)]
 
 use anchor_lang::prelude::*;
+use anchor_spl::{associated_token::AssociatedToken, token_interface::{Mint, TokenAccount, TokenInterface,TransferChecked}};
 
 declare_id!("Count3AcZucFDPSFBAeHkQ6AvttieKUkyJ8HiQGhQwe");
 
 #[program]
 pub mod tokenvesting {
+    use std::iter::Product;
+
     use super::*;
 
-    pub fn close(_ctx: Context<CloseTokenvesting>) -> Result<()> {
-        Ok(())
+    pub fn create_vesting_account(ctx: Context<CreateVestingAccount>) -> Result<()> {
+
+
+            *ctx.accounts.vesting_account = VestingAccount {
+                owner: ctx.accounts.signer.key(),
+                mint: ctx.accounts.mint.key(),
+                treasury_token_account: ctx.accounts.treasury_token_account.key(),
+                company_name: ctx.accounts.signer.key().to_string(),
+                treasury_bump: ctx.bumps.treasury,
+                company_bump: ctx.bumps.company,
+            };
+
     }
 
-    pub fn decrement(ctx: Context<Update>) -> Result<()> {
-        ctx.accounts.tokenvesting.count = ctx.accounts.tokenvesting.count.checked_sub(1).unwrap();
-        Ok(())
+    pub fn create_employee_account(ctx:Context<CreateEmployeeAccount>,start_time:i64,end_time:i64,cliff_time:i64,total_amount:u64) -> Result<()> {
+
+        *ctx.accounts.employee_account = EmployeeAccount {
+            benificiary :ctx.accounts.signer.key(),
+            start_time:start_time,
+            end_time:end_time,
+            cliff_time:cliff_time,
+            total_amount:total_amount,
+            total_withdrawn:0,
+            vesting_account:ctx.accounts.vesting_account.key(),
+            bump:ctx.bumps.employee_account,
+
+        }
     }
 
-    pub fn increment(ctx: Context<Update>) -> Result<()> {
-        ctx.accounts.tokenvesting.count = ctx.accounts.tokenvesting.count.checked_add(1).unwrap();
-        Ok(())
+    pub fn claim_tokens(ctx:Context<ClaimTokens>,company_name:String)->Result<()>{
+        let employee_account = &mut ctx.accounts.employee_account;
+        let now = Clock::get()?.unix_timestamp;
+
+        if now<employee_account.cliff_time{
+            return Err(CustomError::CliffTimeNotReached.into())
+        }
+
+        let time_since_start = now.saturating_sub(employee_account.start_time);
+        let total_vesting_time = employee_account.end_time.saturating_sub(employee_account.start_time);
+
+
+        if total_vesting_time ==0{
+            return Err(CustomError::InvalidVestingPeriod.into())
+        }
+
+        let vested_amount = if now >= employee_account.end_time {
+            return employee_account.total_amount
+        }else {
+            match employee_account.total_amount.checked_mul(time_since_start as u64){
+                Some(product)=>{
+                     product/total_vesting_time as u64
+                },
+                None=>{
+                    return Err(CustomError::CalculationOverflow.into());
+                }
+            }
+        };
+        
+        let claimable_account =  vested_amount.saturating_sub(employee_account.total_withdrawn);
+
+        if claimable_account==0{
+            return Err(CustomError::NotingToClaim.into())
+        }
+
+        let transfer_cpi_accounts = TransferChecked{
+            from:ctx.accounts.treasury_token_account.to_account_info(),
+            mint:ctx.accounts.mint.to_account_info(),
+            to:ctx.accounts.employee_token_account.to_account_info(),
+            authority:ctx.accounts.treasury_token_account.to_account_info(),
+
+        };
+
+        let seeds = &[b"vesting_treasury",ctx.accounts.vesting_account.company_name.as_ref(),&[ctx.accounts.vesting_account.treasury_bump]];
+
+        let signer_seeds = &[seeds[..]];
+
+        let cpi_program = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), transfer_cpi_accounts, signer_seeds);
+
+        transfer_checked(cpi_program,claimable_account as u64,ctx.accounts.mint.decimals)?;
+
+        employee_account.total_amount +=claimable_account;
+
+        return Ok(());
     }
 
-    pub fn initialize(_ctx: Context<InitializeTokenvesting>) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn set(ctx: Context<Update>, value: u8) -> Result<()> {
-        ctx.accounts.tokenvesting.count = value.clone();
-        Ok(())
-    }
 }
 
 #[derive(Accounts)]
-pub struct InitializeTokenvesting<'info> {
+#[instruction(company_name:String)]
+pub struct CreateVestingAccount<'info> {
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub signer: Signer<'info>,
 
-    #[account(
-  init,
-  space = 8 + Tokenvesting::INIT_SPACE,
-  payer = payer
-    )]
-    pub tokenvesting: Account<'info, Tokenvesting>,
+    #[account(init,payer=signer,space= 8+VestingAccount::INIT_SPACE,seeds=[company_name.as_ref()],bump )]
+    pub vesting_account: Account<'info, VestingAccount>,
+
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    #[account(init,payer=signer,token::mint=mint,token::authority=treasury_token_account,seeds=[b"vesting_treasury",company_name.as_bytes()],bump)]
+    pub treasury_token_account: Account<'info, TokenAccount>,
+
     pub system_program: Program<'info, System>,
-}
-#[derive(Accounts)]
-pub struct CloseTokenvesting<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
 
-    #[account(
-  mut,
-  close = payer, // close account and return lamports to payer
-    )]
-    pub tokenvesting: Account<'info, Tokenvesting>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
-pub struct Update<'info> {
+#[instruction(company_name:String)]
+pub struct ClaimTokens<'info>{
     #[account(mut)]
-    pub tokenvesting: Account<'info, Tokenvesting>,
+    pub beneficiary:Signer<'info>,
+
+    #[account(mut,seeds=[b"employee_vesting",beneficiary.key().as_ref(),vesting_account.key().as_ref()],bump=employee_account.bump,has_one=beneficiary,has_one=vesting_account)]
+    pub employee_account:Account<'info,EmployeeAccount>,
+
+
+    #[account(mut,seeds=[company_name.as_ref()],bump=vesting_account.bump,has_one=treasury_token_account,has_one=mint)]
+    pub vesting_account:Account<'info,VestingAccount>,
+
+
+    pub mint:InterfaceAccount<'info,TokenAccount>,
+
+
+    #[account(mut)]
+    pub treasury_token_account:Account<'info,TokenAccount>,
+
+
+    #[account(init_if_needed,
+        payer=beneficiary,
+        associated_token::mint=mint,
+        associated_token::authority=beneficiary,
+        associated_token::token_program=token_program)]
+    pub employee_token_account:Account<'info,TokenAccount>,
+
+    pub token_program : Interface<'info,TokenInterface>,
+
+    pub associated_token_program: Program<'info,AssociatedToken>,
+
+    pub system_program:Program<'info,System>
+    
+}
+
+
+#[derive(Accounts)]
+pub struct CreateEmployeeAccount<'info>{
+    #[account(mut)]
+    pub owner:Signer<'info>,
+
+    pub beneficiary:SystemAccount<'info>,
+
+    #[account(has_one=owner,)]
+    pub vesting_account:Account<'info,VestingAccount>,
+
+    #[account(init,payer=owner,space=8+EmployeeAccount::INIT_SPACE,seeds=[b"employee_vesting",beneficiary.key().as_ref(),vesting_account.key().as_ref()],bump)]
+    pub employee_account:Account<'info,EmployeeAccount>,
+
+    pub system_program:Program<'info,System>
+    
+
 }
 
 #[account]
 #[derive(InitSpace)]
-pub struct Tokenvesting {
-    count: u8,
+pub struct VestingAccount {
+    pub owner: Pubkey,
+    pub mint: Pubkey,
+    pub treasury_token_account: Pubkey,
+    #[max_len(20)]
+    pub company_name: String,
+    pub treasury_bump: u8,
+    pub company_bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct EmployeeAccount {
+    pub benificiary: Pubkey,
+    pub start_time: i64,
+    pub end_time: i64,
+    pub cliff_time: i64,
+    pub vesting_account: Pubkey,
+    pub total_amount: u64,
+    pub total_withdrawn: u64,
+    pub bump:u8,
+}
+
+
+#[error_code]
+pub enum CustomError{
+    #[msg("Cliff time has not reached")]
+    CliffTimeNotReached,
+
+    #[msg("Invalid vestinf period")]
+    InvalidVestingPeriod,
+
+    #[msg("Calculation Overflow")]
+    CalculationOverflow,
+
+    #[msg("NotingToClaim")]
+    NotingToClaim
 }

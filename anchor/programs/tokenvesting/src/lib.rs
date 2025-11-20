@@ -1,13 +1,14 @@
 #![allow(clippy::result_large_err)]
 
 use anchor_lang::prelude::*;
-use anchor_spl::{associated_token::AssociatedToken, token_interface::{Mint, TokenAccount, TokenInterface,TransferChecked}};
+use anchor_spl::{associated_token::AssociatedToken, token_interface::{Mint, TokenAccount, TokenInterface,TransferChecked,transfer_checked}};
 
 declare_id!("Count3AcZucFDPSFBAeHkQ6AvttieKUkyJ8HiQGhQwe");
 
 #[program]
 pub mod tokenvesting {
-    use std::iter::Product;
+
+
 
     use super::*;
 
@@ -19,16 +20,20 @@ pub mod tokenvesting {
                 mint: ctx.accounts.mint.key(),
                 treasury_token_account: ctx.accounts.treasury_token_account.key(),
                 company_name: ctx.accounts.signer.key().to_string(),
-                treasury_bump: ctx.bumps.treasury,
-                company_bump: ctx.bumps.company,
+                treasury_bump: ctx.bumps.treasury_token_account,
+                bump: ctx.bumps.vesting_account,
             };
+
+            return Ok(());
+
+            
 
     }
 
     pub fn create_employee_account(ctx:Context<CreateEmployeeAccount>,start_time:i64,end_time:i64,cliff_time:i64,total_amount:u64) -> Result<()> {
 
         *ctx.accounts.employee_account = EmployeeAccount {
-            benificiary :ctx.accounts.signer.key(),
+            benificiary :ctx.accounts.beneficiary.key(),
             start_time:start_time,
             end_time:end_time,
             cliff_time:cliff_time,
@@ -37,10 +42,12 @@ pub mod tokenvesting {
             vesting_account:ctx.accounts.vesting_account.key(),
             bump:ctx.bumps.employee_account,
 
-        }
+        };
+
+        return Ok(());
     }
 
-    pub fn claim_tokens(ctx:Context<ClaimTokens>,company_name:String)->Result<()>{
+    pub fn claim_tokens(ctx:Context<ClaimTokens>,_company_name:String)->Result<()>{
         let employee_account = &mut ctx.accounts.employee_account;
         let now = Clock::get()?.unix_timestamp;
 
@@ -57,15 +64,18 @@ pub mod tokenvesting {
         }
 
         let vested_amount = if now >= employee_account.end_time {
-            return employee_account.total_amount
+             employee_account.total_amount as u64
         }else {
-            match employee_account.total_amount.checked_mul(time_since_start as u64){
-                Some(product)=>{
-                     product/total_vesting_time as u64
-                },
-                None=>{
-                    return Err(CustomError::CalculationOverflow.into());
+            match employee_account.total_amount.checked_mul(time_since_start as u64) {
+
+                Some(product)=>(
+                    product/total_vesting_time as u64
+                ),
+                None =>{
+                    return  Err(CustomError::NotingToClaim.into());
                 }
+
+                
             }
         };
         
@@ -83,11 +93,11 @@ pub mod tokenvesting {
 
         };
 
-        let seeds = &[b"vesting_treasury",ctx.accounts.vesting_account.company_name.as_ref(),&[ctx.accounts.vesting_account.treasury_bump]];
+        let seeds = &[b"vesting_treasury",ctx.accounts.vesting_account.company_name.as_bytes(),&[ctx.accounts.vesting_account.treasury_bump]];
 
-        let signer_seeds = &[seeds[..]];
+        let signer_seeds = [&seeds[..]];
 
-        let cpi_program = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), transfer_cpi_accounts, signer_seeds);
+        let cpi_program = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), transfer_cpi_accounts, &signer_seeds);
 
         transfer_checked(cpi_program,claimable_account as u64,ctx.accounts.mint.decimals)?;
 
@@ -110,7 +120,7 @@ pub struct CreateVestingAccount<'info> {
     pub mint: InterfaceAccount<'info, Mint>,
 
     #[account(init,payer=signer,token::mint=mint,token::authority=treasury_token_account,seeds=[b"vesting_treasury",company_name.as_bytes()],bump)]
-    pub treasury_token_account: Account<'info, TokenAccount>,
+    pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
 
     pub system_program: Program<'info, System>,
 
@@ -121,9 +131,9 @@ pub struct CreateVestingAccount<'info> {
 #[instruction(company_name:String)]
 pub struct ClaimTokens<'info>{
     #[account(mut)]
-    pub beneficiary:Signer<'info>,
+    pub benificiary:Signer<'info>,
 
-    #[account(mut,seeds=[b"employee_vesting",beneficiary.key().as_ref(),vesting_account.key().as_ref()],bump=employee_account.bump,has_one=beneficiary,has_one=vesting_account)]
+    #[account(mut,seeds=[b"employee_vesting",benificiary.key().as_ref(),vesting_account.key().as_ref()],bump=employee_account.bump,has_one=benificiary,has_one=vesting_account)]
     pub employee_account:Account<'info,EmployeeAccount>,
 
 
@@ -131,19 +141,19 @@ pub struct ClaimTokens<'info>{
     pub vesting_account:Account<'info,VestingAccount>,
 
 
-    pub mint:InterfaceAccount<'info,TokenAccount>,
+    pub mint:InterfaceAccount<'info,Mint>,
 
 
     #[account(mut)]
-    pub treasury_token_account:Account<'info,TokenAccount>,
+    pub treasury_token_account:InterfaceAccount<'info,TokenAccount>,
 
 
     #[account(init_if_needed,
-        payer=beneficiary,
+        payer=benificiary,
         associated_token::mint=mint,
-        associated_token::authority=beneficiary,
+        associated_token::authority=benificiary,
         associated_token::token_program=token_program)]
-    pub employee_token_account:Account<'info,TokenAccount>,
+    pub employee_token_account:InterfaceAccount<'info,TokenAccount>,
 
     pub token_program : Interface<'info,TokenInterface>,
 
@@ -181,7 +191,7 @@ pub struct VestingAccount {
     #[max_len(20)]
     pub company_name: String,
     pub treasury_bump: u8,
-    pub company_bump: u8,
+    pub bump: u8,
 }
 
 #[account]
